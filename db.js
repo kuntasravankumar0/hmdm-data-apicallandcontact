@@ -5,20 +5,23 @@ const { Pool } = require('pg');
 let pool;
 
 // Conservative defaults for 512MB RAM
-const POOL_MAX = parseInt(process.env.POOL_MAX || '3');     // Max 3 connections (was 15)
-const CHUNK_SIZE = parseInt(process.env.CHUNK_SIZE || '20'); // Smaller chunks (was 100)
-const DB_TIMEOUT = parseInt(process.env.DB_TIMEOUT || '15000'); // Faster timeout (was 30000)
+const POOL_MAX = parseInt(process.env.POOL_MAX || '3');     // Max 3 connections
+const CHUNK_SIZE = parseInt(process.env.CHUNK_SIZE || '20'); // Smaller chunks
+const DB_TIMEOUT = parseInt(process.env.DB_TIMEOUT || '15000'); // 15s query timeout
 
 function getPool() {
   if (!pool) {
-    // FIX: Node 24.x + newer pg treats sslmode=require as verify-full,
-    // causing "self-signed certificate in certificate chain" for Aiven.
-    // Strip sslmode from connection string; rely on ssl object below.
+    // IMPORTANT: Node 24.x + newer pg (v9+) treats sslmode=require as
+    // an alias for verify-full, causing "self-signed certificate in
+    // certificate chain" errors on Aiven PostgreSQL.
+    //
+    // Solution: Strip ALL sslmode parameters from the connection string
+    // and rely exclusively on the Pool's ssl config object below.
     let rawUrl = process.env.DATABASE_URL || 
       `postgresql://${process.env.DB_USERNAME || 'avnadmin'}:${encodeURIComponent(process.env.DB_PASSWORD || '')}@${process.env.DB_HOST || 'pg-7cd95c5-elenah-4365.l.aivencloud.com'}:${process.env.DB_PORT || '20827'}/${process.env.DB_NAME || 'defaultdb'}?connectTimeout=10`;
     
-    // Sanitize: replace any sslmode=require with no-verify for self-signed certs
-    const connectionString = rawUrl.replace(/sslmode=require/gi, 'sslmode=no-verify');
+    // Strip any sslmode parameter from the query string (case-insensitive)
+    const connectionString = rawUrl.replace(/[?&]sslmode=[^&#]+/gi, '');
     
     pool = new Pool({
       connectionString,
@@ -73,7 +76,6 @@ async function batchUpsert(table, columns, items, conflictColumns, updateColumns
   const pool = getPool();
   const client = await pool.connect();
   let saved = 0;
-  let skipped = 0;
 
   try {
     for (let i = 0; i < items.length; i += CHUNK_SIZE) {
@@ -112,11 +114,10 @@ async function batchUpsert(table, columns, items, conflictColumns, updateColumns
 
       const result = await client.query(query, values);
       saved += result.rowCount;
-
       chunk.length = 0;
     }
 
-    return { saved, updated: 0, skipped };
+    return { saved, updated: 0, skipped: 0 };
   } catch (err) {
     throw err;
   } finally {
@@ -200,9 +201,7 @@ async function initDatabase() {
       'CREATE INDEX IF NOT EXISTS idx_deviceinfo_device ON device_info(device_id)',
     ];
 
-    for (const idx of indexes) {
-      await client.query(idx);
-    }
+    for (const idx of indexes) { await client.query(idx); }
 
     console.log('[DB] All tables and indexes ready');
   } catch (err) {
