@@ -14,7 +14,7 @@ const app = express();
 const PORT = process.env.PORT || 3001;
 const API_KEY = process.env.API_KEY || '';
 
-// JWT config
+// JWT config (override via env var for production)
 const JWT_SECRET = process.env.JWT_SECRET || 'hmdm-data-api-secret-key-2024';
 const JWT_EXPIRES_IN = '24h';
 
@@ -47,43 +47,36 @@ app.use((req, res, next) => {
 });
 
 // === JWT AUTH MIDDLEWARE ===
-// Protects all routes except /health, /login, /api/auth/*
+// Only protects /api/* routes (except /api/auth/*).
+// HTML pages (/, /dashboard, /login) are served without auth.
+// The frontend JS checks localStorage for the JWT and redirects to /login if missing.
+// API calls from the frontend include Authorization: Bearer header.
+function extractToken(req) {
+  const authHeader = req.headers['authorization'];
+  if (authHeader && authHeader.startsWith('Bearer ')) {
+    return authHeader.substring(7);
+  }
+  if (req.query.token) {
+    return req.query.token;
+  }
+  return null;
+}
+
 function authMiddleware(req, res, next) {
-  // Public routes (no auth required)
-  const publicPaths = ['/health', '/login', '/api/auth'];
-  if (publicPaths.some(p => req.path.startsWith(p))) {
+  // Public paths
+  if (req.path === '/health' || req.path.startsWith('/api/auth')) {
     return next();
-  }
-  
-  // Static files: login.html and dashboard.html need checking
-  // Dashboard needs auth, login page is public
-  if (req.path === '/' || req.path === '/login' || req.path === '/login.html') {
-    return next();
-  }
-  
-  // For dashboard page, check JWT
-  if (req.path.startsWith('/dashboard')) {
-    const token = extractToken(req);
-    if (!token) {
-      return res.redirect('/login');
-    }
-    try {
-      jwt.verify(token, JWT_SECRET);
-      return next();
-    } catch (err) {
-      return res.redirect('/login');
-    }
   }
 
-  // For API routes (except /api/auth), require JWT or API key
-  if (req.path.startsWith('/api') && !req.path.startsWith('/api/auth')) {
-    // API key check takes priority (for device syncs)
+  // Only protect /api/* routes (not static HTML)
+  if (req.path.startsWith('/api')) {
+    // API key takes priority (for device sync apps)
     const apiKey = req.headers['x-api-key'] || req.query.api_key;
     if (apiKey && apiKey === API_KEY) {
       return next();
     }
-    
-    // JWT check for web dashboard
+
+    // JWT for web dashboard calls
     const token = extractToken(req);
     if (token) {
       try {
@@ -93,44 +86,30 @@ function authMiddleware(req, res, next) {
         return res.status(401).json({ status: 'error', message: 'Session expired. Please login again.' });
       }
     }
-    
+
     return res.status(401).json({ status: 'error', message: 'Authentication required' });
   }
-  
-  next();
-}
 
-function extractToken(req) {
-  // Check Authorization header first
-  const authHeader = req.headers['authorization'];
-  if (authHeader && authHeader.startsWith('Bearer ')) {
-    return authHeader.substring(7);
-  }
-  // Check query param
-  if (req.query.token) {
-    return req.query.token;
-  }
-  return null;
+  next();
 }
 
 app.use(authMiddleware);
 
 // === AUTH ROUTES ===
-// POST /api/auth/login - Validate credentials via hmdmbackend, issue JWT
+
+// POST /api/auth/login - Proxy credentials to hmdmbackend, issue our JWT on success
 app.post('/api/auth/login', async (req, res) => {
   const { login, password } = req.body;
-  
+
   if (!login || !password) {
     return res.status(400).json({ status: 'error', message: 'Missing login or password' });
   }
-  
+
   try {
-    // Proxy login request to hmdmbackend
     const https = require('https');
     const postData = JSON.stringify({ login, password });
-    
     const url = new URL(HMDM_BACKEND_URL + '/rest/public/jwt/login');
-    
+
     const response = await new Promise((resolve, reject) => {
       const options = {
         hostname: url.hostname,
@@ -143,52 +122,37 @@ app.post('/api/auth/login', async (req, res) => {
         },
         timeout: 15000
       };
-      
+
       const reqHttps = https.request(options, (resHttp) => {
         let data = '';
         resHttp.on('data', chunk => data += chunk);
-        resHttp.on('end', () => {
-          resolve({ status: resHttp.statusCode, body: data });
-        });
+        resHttp.on('end', () => resolve({ status: resHttp.statusCode, body: data }));
       });
-      
+
       reqHttps.on('error', reject);
       reqHttps.on('timeout', () => { reqHttps.destroy(); reject(new Error('Timeout')); });
       reqHttps.write(postData);
       reqHttps.end();
     });
-    
+
     if (response.status === 200) {
-      // Login success - create our own JWT
       const token = jwt.sign(
         { username: login, auth: 'dashboard', iat: Math.floor(Date.now() / 1000) },
         JWT_SECRET,
         { expiresIn: JWT_EXPIRES_IN }
       );
-      
-      return res.json({
-        status: 'success',
-        token,
-        message: 'Login successful'
-      });
+      return res.json({ status: 'success', token, message: 'Login successful' });
     }
-    
-    // Login failed
-    return res.status(401).json({
-      status: 'error',
-      message: 'Invalid username or password'
-    });
-    
+
+    return res.status(401).json({ status: 'error', message: 'Invalid username or password' });
+
   } catch (err) {
     console.error('[Auth] Login proxy error:', err.message);
-    return res.status(503).json({
-      status: 'error',
-      message: 'Authentication service unavailable. Please try again.'
-    });
+    return res.status(503).json({ status: 'error', message: 'Authentication service unavailable. Please try again.' });
   }
 });
 
-// GET /api/auth/verify - Verify current token is still valid
+// GET /api/auth/verify - Check if current token is still valid
 app.get('/api/auth/verify', (req, res) => {
   const token = extractToken(req);
   if (!token) {
@@ -202,25 +166,19 @@ app.get('/api/auth/verify', (req, res) => {
   }
 });
 
-// === STATIC FILES ===
-// Root serves dashboard if authenticated, login page otherwise
+// === STATIC FILES & PAGES ===
+
+// Root → always serve login page (no server-side auth check)
 app.get('/', (req, res) => {
-  const token = extractToken(req);
-  if (token) {
-    try {
-      jwt.verify(token, JWT_SECRET);
-      return res.sendFile(path.join(__dirname, 'public', 'dashboard.html'));
-    } catch (e) {}
-  }
   res.sendFile(path.join(__dirname, 'public', 'login.html'));
 });
 
-// Serve login page explicitly
 app.get('/login', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'login.html'));
 });
 
-// Serve dashboard page explicitly (auth checked via middleware)
+// Dashboard page is served without server-side auth.
+// The frontend JS checks localStorage for the JWT and redirects to /login if missing.
 app.get('/dashboard', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'dashboard.html'));
 });
@@ -321,7 +279,7 @@ async function start() {
     app.listen(PORT, '0.0.0.0', () => {
       const mem = process.memoryUsage();
       console.log(`[Server] hmdm-data-api running on port ${PORT}`);
-      console.log(`[Server] Auth: JWT enabled (backend: ${HMDM_BACKEND_URL})`);
+      console.log(`[Server] Auth: JWT with hmdmbackend at ${HMDM_BACKEND_URL}`);
       console.log(`[Server] Memory: ${Math.round(mem.rss/1024/1024)}MB RSS | ${Math.round(mem.heapUsed/1024/1024)}MB heap`);
       console.log(`[Server] Health: http://localhost:${PORT}/health`);
     });
