@@ -1,37 +1,67 @@
 // Database connection and table initialization
+// OPTIMIZED for 512MB RAM instances
 const { Pool } = require('pg');
 
 let pool;
 
-// Connection pool config - pool size configurable via env var
-const POOL_MAX = parseInt(process.env.POOL_MAX || '15'); // Default 15
-const DB_TIMEOUT = parseInt(process.env.DB_TIMEOUT || '30000');
+// Conservative defaults for 512MB RAM
+const POOL_MAX = parseInt(process.env.POOL_MAX || '3');     // Max 3 connections (was 15)
+const CHUNK_SIZE = parseInt(process.env.CHUNK_SIZE || '20'); // Smaller chunks (was 100)
+const DB_TIMEOUT = parseInt(process.env.DB_TIMEOUT || '15000'); // Faster timeout (was 30000)
 
 function getPool() {
   if (!pool) {
     const connectionString = process.env.DATABASE_URL || 
-      `postgresql://${process.env.DB_USERNAME || 'avnadmin'}:${encodeURIComponent(process.env.DB_PASSWORD || '')}@${process.env.DB_HOST || 'pg-7cd95c5-elenah-4365.l.aivencloud.com'}:${process.env.DB_PORT || '20827'}/${process.env.DB_NAME || 'defaultdb'}?sslmode=require`;
+      `postgresql://${process.env.DB_USERNAME || 'avnadmin'}:${encodeURIComponent(process.env.DB_PASSWORD || '')}@${process.env.DB_HOST || 'pg-7cd95c5-elenah-4365.l.aivencloud.com'}:${process.env.DB_PORT || '20827'}/${process.env.DB_NAME || 'defaultdb'}?sslmode=require&connectTimeout=10`;
     
     pool = new Pool({
       connectionString,
       ssl: { rejectUnauthorized: false },
       max: POOL_MAX,
-      idleTimeoutMillis: 30000,
-      connectionTimeoutMillis: 15000,
+      idleTimeoutMillis: 10000,       // Faster idle cleanup (was 30000)
+      connectionTimeoutMillis: 10000,  // Faster connection timeout
       query_timeout: DB_TIMEOUT,
-      statement_timeout: DB_TIMEOUT * 1.5
+      statement_timeout: DB_TIMEOUT,
+      maxUses: 50,                     // Recycle connections to prevent memory leaks
     });
     
     pool.on('error', (err) => {
-      console.error('[DB] Unexpected pool error:', err.message);
+      console.error('[DB] Pool error:', err.message);
     });
 
-    console.log(`[DB] Connection pool created (max: ${POOL_MAX})`);
+    console.log(`[DB] Pool created (max: ${POOL_MAX}, chunk: ${CHUNK_SIZE})`);
   }
   return pool;
 }
 
-// Batch upsert helper - processes items in chunks to reduce server load
+// Memory check helper - warns if memory usage is too high
+function checkMemory() {
+  const usage = process.memoryUsage();
+  const heapMB = Math.round(usage.heapUsed / 1024 / 1024);
+  const rssMB = Math.round(usage.rss / 1024 / 1024);
+  
+  if (heapMB > 300 || rssMB > 400) {
+    console.warn(`[MEMORY] High usage - heap: ${heapMB}MB, RSS: ${rssMB}MB`);
+    // Trigger GC hint if available
+    if (global.gc) {
+      global.gc();
+      const afterGC = Math.round(process.memoryUsage().heapUsed / 1024 / 1024);
+      console.log(`[MEMORY] GC freed ${heapMB - afterGC}MB (heap: ${afterGC}MB)`);
+    }
+    return true;
+  }
+  return false;
+}
+
+// Log memory periodically
+function startMemoryMonitor() {
+  setInterval(() => {
+    const usage = process.memoryUsage();
+    console.log(`[MEM] RSS:${Math.round(usage.rss/1024/1024)}M Heap:${Math.round(usage.heapUsed/1024/1024)}M/${Math.round(usage.heapTotal/1024/1024)}M Ext:${Math.round(usage.external/1024/1024)}M`);
+  }, 60000);
+}
+
+// Batch upsert - memory-optimized with smaller chunks
 async function batchUpsert(table, columns, items, conflictColumns, updateColumns, onConflictAction = 'UPDATE') {
   if (!items || items.length === 0) return { saved: 0, updated: 0, skipped: 0 };
 
@@ -41,8 +71,7 @@ async function batchUpsert(table, columns, items, conflictColumns, updateColumns
   let skipped = 0;
 
   try {
-    // Process in chunks to avoid massive queries
-    const CHUNK_SIZE = 100;
+    // Process in SMALL chunks to minimize memory per query
     for (let i = 0; i < items.length; i += CHUNK_SIZE) {
       const chunk = items.slice(i, i + CHUNK_SIZE);
       
@@ -52,7 +81,7 @@ async function batchUpsert(table, columns, items, conflictColumns, updateColumns
       let paramIndex = 1;
 
       for (const item of chunk) {
-        const rowPlaceholders = columns.map(col => `$${paramIndex++}`);
+        const rowPlaceholders = columns.map(() => `$${paramIndex++}`);
         placeholders.push(`(${rowPlaceholders.join(', ')})`);
         for (const col of columns) {
           values.push(item[col] !== undefined ? item[col] : null);
@@ -81,6 +110,9 @@ async function batchUpsert(table, columns, items, conflictColumns, updateColumns
 
       const result = await client.query(query, values);
       saved += result.rowCount;
+
+      // Free chunk memory
+      chunk.length = 0;
     }
 
     return { saved, updated: 0, skipped };
@@ -95,7 +127,7 @@ async function batchUpsert(table, columns, items, conflictColumns, updateColumns
 async function initDatabase() {
   const client = await getPool().connect();
   try {
-    // Create contacts table (dedup by device_id + contact_id)
+    // Create contacts table
     await client.query(`
       CREATE TABLE IF NOT EXISTS device_contacts (
         id SERIAL PRIMARY KEY,
@@ -113,7 +145,7 @@ async function initDatabase() {
       );
     `);
 
-    // Create call logs table (dedup by device_id + call_date + phone + type + duration)
+    // Create call logs table
     await client.query(`
       CREATE TABLE IF NOT EXISTS device_call_logs (
         id SERIAL PRIMARY KEY,
@@ -130,7 +162,7 @@ async function initDatabase() {
       );
     `);
 
-    // Create notifications table (dedup by device_id + received_at + package + title)
+    // Create notifications table
     await client.query(`
       CREATE TABLE IF NOT EXISTS device_notifications (
         id SERIAL PRIMARY KEY,
@@ -158,7 +190,7 @@ async function initDatabase() {
       );
     `);
 
-    // Create optimized indexes for fast search
+    // Create optimized indexes
     const indexes = [
       'CREATE INDEX IF NOT EXISTS idx_contacts_device ON device_contacts(device_id)',
       'CREATE INDEX IF NOT EXISTS idx_contacts_name ON device_contacts(name)',
@@ -178,11 +210,11 @@ async function initDatabase() {
 
     console.log('[DB] All tables and indexes ready');
   } catch (err) {
-    console.error('[DB] Table initialization error:', err.message);
+    console.error('[DB] Init error:', err.message);
     throw err;
   } finally {
     client.release();
   }
 }
 
-module.exports = { getPool, initDatabase, batchUpsert };
+module.exports = { getPool, initDatabase, batchUpsert, checkMemory, startMemoryMonitor, CHUNK_SIZE };
