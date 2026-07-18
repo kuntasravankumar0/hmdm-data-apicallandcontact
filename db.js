@@ -25,7 +25,7 @@ async function initDatabase() {
       CREATE TABLE IF NOT EXISTS device_contacts (
         id SERIAL PRIMARY KEY,
         device_id VARCHAR(255) NOT NULL,
-        contact_id VARCHAR(255) NOT NULL,
+        contact_id VARCHAR(255) NOT NULL DEFAULT '',
         name VARCHAR(500) DEFAULT '',
         phone VARCHAR(255) DEFAULT '',
         phone_type VARCHAR(100) DEFAULT '',
@@ -45,7 +45,7 @@ async function initDatabase() {
         device_id VARCHAR(255) NOT NULL,
         call_id VARCHAR(255) DEFAULT '',
         phone_number VARCHAR(255) DEFAULT '',
-        call_type VARCHAR(50) DEFAULT '',  // INCOMING, OUTGOING, MISSED
+        call_type VARCHAR(50) DEFAULT '',
         duration_sec INTEGER DEFAULT 0,
         call_date BIGINT NOT NULL,
         contact_name VARCHAR(500) DEFAULT '',
@@ -71,6 +71,18 @@ async function initDatabase() {
       );
     `);
 
+    // Create device info table
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS device_info (
+        id SERIAL PRIMARY KEY,
+        device_id VARCHAR(255) UNIQUE NOT NULL,
+        info_data JSONB DEFAULT '{}',
+        synced_at BIGINT NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+
     // Create indexes for faster queries
     await client.query(`
       CREATE INDEX IF NOT EXISTS idx_contacts_device ON device_contacts(device_id);
@@ -79,9 +91,10 @@ async function initDatabase() {
       CREATE INDEX IF NOT EXISTS idx_calllogs_date ON device_call_logs(call_date DESC);
       CREATE INDEX IF NOT EXISTS idx_notifications_device ON device_notifications(device_id);
       CREATE INDEX IF NOT EXISTS idx_notifications_time ON device_notifications(received_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_deviceinfo_device ON device_info(device_id);
     `);
 
-    console.log('[DB] Tables initialized successfully');
+    console.log('[DB] All tables initialized successfully');
   } catch (err) {
     console.error('[DB] Table initialization error:', err.message);
     throw err;

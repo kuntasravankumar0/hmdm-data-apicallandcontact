@@ -11,12 +11,30 @@ const notificationsRouter = require('./routes/notifications');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
+const API_KEY = process.env.API_KEY || '';
 
 // Security & parsing middleware
 app.use(helmet({ contentSecurityPolicy: false }));
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true }));
+
+// API Key authentication middleware for write operations
+function authMiddleware(req, res, next) {
+  // Skip auth for GET, health, and when no API key is configured
+  if (req.method === 'GET' || !API_KEY) {
+    return next();
+  }
+  
+  const apiKey = req.headers['x-api-key'] || req.query.api_key;
+  if (apiKey !== API_KEY) {
+    return res.status(401).json({ status: 'error', message: 'Invalid or missing API key' });
+  }
+  next();
+}
+
+// Apply auth to all /api routes
+app.use('/api', authMiddleware);
 
 // Serve static files (web UI)
 app.use(express.static(path.join(__dirname, 'public')));
@@ -34,7 +52,9 @@ app.use('/api/notifications', notificationsRouter);
 // Device info endpoints
 app.post('/api/device/info', async (req, res) => {
   const { deviceId, info } = req.body;
-  if (!deviceId) return res.status(400).json({ status: 'error', message: 'Missing deviceId' });
+  if (!deviceId) {
+    return res.status(400).json({ status: 'error', message: 'Missing deviceId' });
+  }
   
   try {
     const { getPool } = require('./db');
@@ -52,7 +72,7 @@ app.post('/api/device/info', async (req, res) => {
     res.json({ status: 'success', deviceId });
   } catch (err) {
     console.error('[Device] Info error:', err.message);
-    res.status(500).json({ status: 'error', message: err.message });
+    res.status(500).json({ status: 'error', message: 'Internal server error' });
   }
 });
 
@@ -70,7 +90,7 @@ app.get('/api/device/info', async (req, res) => {
     res.json({ status: 'success', data: result.rows });
   } catch (err) {
     console.error('[Device] Get error:', err.message);
-    res.status(500).json({ status: 'error', message: err.message });
+    res.status(500).json({ status: 'error', message: 'Internal server error' });
   }
 });
 
@@ -107,7 +127,7 @@ app.get('/api/summary', async (req, res) => {
     });
   } catch (err) {
     console.error('[Summary] Error:', err.message);
-    res.status(500).json({ status: 'error', message: err.message });
+    res.status(500).json({ status: 'error', message: 'Internal server error' });
   }
 });
 
@@ -116,25 +136,9 @@ async function start() {
   try {
     await initDatabase();
     
-    // Also create device_info table
-    const { getPool } = require('./db');
-    const pool = getPool();
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS device_info (
-        id SERIAL PRIMARY KEY,
-        device_id VARCHAR(255) UNIQUE NOT NULL,
-        info_data JSONB DEFAULT '{}',
-        synced_at BIGINT NOT NULL,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-      );
-    `);
-    console.log('[DB] Device info table ready');
-    
     app.listen(PORT, '0.0.0.0', () => {
       console.log(`[Server] hmdm-data-api running on port ${PORT}`);
       console.log(`[Server] Web UI: http://localhost:${PORT}`);
-      console.log(`[Server] API: http://localhost:${PORT}/api`);
       console.log(`[Server] Health: http://localhost:${PORT}/health`);
     });
   } catch (err) {
