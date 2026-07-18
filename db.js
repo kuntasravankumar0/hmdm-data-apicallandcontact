@@ -20,8 +20,10 @@ function getPool() {
     let rawUrl = process.env.DATABASE_URL || 
       `postgresql://${process.env.DB_USERNAME || 'avnadmin'}:${encodeURIComponent(process.env.DB_PASSWORD || '')}@${process.env.DB_HOST || 'pg-7cd95c5-elenah-4365.l.aivencloud.com'}:${process.env.DB_PORT || '20827'}/${process.env.DB_NAME || 'defaultdb'}?connectTimeout=10`;
     
-    // Strip any sslmode parameter from the query string (case-insensitive)
-    const connectionString = rawUrl.replace(/[?&]sslmode=[^&#]+/gi, '');
+    // Strip any sslmode parameter from the query string.
+    // Preserve the ? or & delimiter so multi-param URLs stay valid.
+    // e.g. "?sslmode=require&connectTimeout=10" → "?&connectTimeout=10"
+    const connectionString = rawUrl.replace(/([?&])sslmode=[^&#]+/gi, '$1');
     
     pool = new Pool({
       connectionString,
