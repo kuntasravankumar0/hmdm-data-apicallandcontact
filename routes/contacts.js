@@ -1,5 +1,5 @@
 const express = require('express');
-const { getPool, batchUpsert, CHUNK_SIZE } = require('../db');
+const { getPool, batchUpsert } = require('../db');
 
 const router = express.Router();
 
