@@ -11,18 +11,24 @@ const DB_TIMEOUT = parseInt(process.env.DB_TIMEOUT || '15000'); // Faster timeou
 
 function getPool() {
   if (!pool) {
-    const connectionString = process.env.DATABASE_URL || 
-      `postgresql://${process.env.DB_USERNAME || 'avnadmin'}:${encodeURIComponent(process.env.DB_PASSWORD || '')}@${process.env.DB_HOST || 'pg-7cd95c5-elenah-4365.l.aivencloud.com'}:${process.env.DB_PORT || '20827'}/${process.env.DB_NAME || 'defaultdb'}?sslmode=require&connectTimeout=10`;
+    // FIX: Node 24.x + newer pg treats sslmode=require as verify-full,
+    // causing "self-signed certificate in certificate chain" for Aiven.
+    // Strip sslmode from connection string; rely on ssl object below.
+    let rawUrl = process.env.DATABASE_URL || 
+      `postgresql://${process.env.DB_USERNAME || 'avnadmin'}:${encodeURIComponent(process.env.DB_PASSWORD || '')}@${process.env.DB_HOST || 'pg-7cd95c5-elenah-4365.l.aivencloud.com'}:${process.env.DB_PORT || '20827'}/${process.env.DB_NAME || 'defaultdb'}?connectTimeout=10`;
+    
+    // Sanitize: replace any sslmode=require with no-verify for self-signed certs
+    const connectionString = rawUrl.replace(/sslmode=require/gi, 'sslmode=no-verify');
     
     pool = new Pool({
       connectionString,
       ssl: { rejectUnauthorized: false },
       max: POOL_MAX,
-      idleTimeoutMillis: 10000,       // Faster idle cleanup (was 30000)
-      connectionTimeoutMillis: 10000,  // Faster connection timeout
+      idleTimeoutMillis: 10000,
+      connectionTimeoutMillis: 10000,
       query_timeout: DB_TIMEOUT,
       statement_timeout: DB_TIMEOUT,
-      maxUses: 50,                     // Recycle connections to prevent memory leaks
+      maxUses: 50,
     });
     
     pool.on('error', (err) => {
@@ -42,7 +48,6 @@ function checkMemory() {
   
   if (heapMB > 300 || rssMB > 400) {
     console.warn(`[MEMORY] High usage - heap: ${heapMB}MB, RSS: ${rssMB}MB`);
-    // Trigger GC hint if available
     if (global.gc) {
       global.gc();
       const afterGC = Math.round(process.memoryUsage().heapUsed / 1024 / 1024);
@@ -71,11 +76,9 @@ async function batchUpsert(table, columns, items, conflictColumns, updateColumns
   let skipped = 0;
 
   try {
-    // Process in SMALL chunks to minimize memory per query
     for (let i = 0; i < items.length; i += CHUNK_SIZE) {
       const chunk = items.slice(i, i + CHUNK_SIZE);
       
-      // Build multi-row INSERT with parameterized values
       const placeholders = [];
       const values = [];
       let paramIndex = 1;
@@ -88,7 +91,6 @@ async function batchUpsert(table, columns, items, conflictColumns, updateColumns
         }
       }
 
-      // Build conflict resolution
       const conflictTarget = conflictColumns.map(c => `"${c}"`).join(', ');
       
       let updateClause;
@@ -111,7 +113,6 @@ async function batchUpsert(table, columns, items, conflictColumns, updateColumns
       const result = await client.query(query, values);
       saved += result.rowCount;
 
-      // Free chunk memory
       chunk.length = 0;
     }
 
@@ -127,7 +128,6 @@ async function batchUpsert(table, columns, items, conflictColumns, updateColumns
 async function initDatabase() {
   const client = await getPool().connect();
   try {
-    // Create contacts table
     await client.query(`
       CREATE TABLE IF NOT EXISTS device_contacts (
         id SERIAL PRIMARY KEY,
@@ -145,7 +145,6 @@ async function initDatabase() {
       );
     `);
 
-    // Create call logs table
     await client.query(`
       CREATE TABLE IF NOT EXISTS device_call_logs (
         id SERIAL PRIMARY KEY,
@@ -162,7 +161,6 @@ async function initDatabase() {
       );
     `);
 
-    // Create notifications table
     await client.query(`
       CREATE TABLE IF NOT EXISTS device_notifications (
         id SERIAL PRIMARY KEY,
@@ -178,7 +176,6 @@ async function initDatabase() {
       );
     `);
 
-    // Create device info table
     await client.query(`
       CREATE TABLE IF NOT EXISTS device_info (
         id SERIAL PRIMARY KEY,
@@ -190,7 +187,6 @@ async function initDatabase() {
       );
     `);
 
-    // Create optimized indexes
     const indexes = [
       'CREATE INDEX IF NOT EXISTS idx_contacts_device ON device_contacts(device_id)',
       'CREATE INDEX IF NOT EXISTS idx_contacts_name ON device_contacts(name)',
