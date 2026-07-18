@@ -31,9 +31,13 @@ router.post('/sync', async (req, res) => {
       const phoneType = String(contact.phoneType || '');
       const email = String(contact.email || '');
 
-      if (!contactId && !phone) continue; // Skip if no identifier
+      // If contact_id is empty, use phone or email as dedup key
+      const effectiveContactId = contactId || 
+        (phone ? `phone:${phone}` : '') || 
+        (email ? `email:${email}` : '') || 
+        `unknown:${now}`;
 
-      // Try to update existing contact first
+      // Upsert: insert or update existing contact
       const result = await client.query(
         `INSERT INTO device_contacts (device_id, contact_id, name, phone, phone_type, email, raw_data, synced_at)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
@@ -47,7 +51,7 @@ router.post('/sync', async (req, res) => {
            synced_at = EXCLUDED.synced_at,
            updated_at = CURRENT_TIMESTAMP
          RETURNING (xmax = 0) AS inserted`,
-        [deviceId, contactId, name, phone, phoneType, email, JSON.stringify(contact), now]
+        [deviceId, effectiveContactId, name, phone, phoneType, email, JSON.stringify(contact), now]
       );
       
       if (result.rows[0]?.inserted) {
@@ -68,7 +72,7 @@ router.post('/sync', async (req, res) => {
   } catch (err) {
     await client.query('ROLLBACK');
     console.error('[Contacts] Sync error:', err.message);
-    res.status(500).json({ status: 'error', message: err.message });
+    res.status(500).json({ status: 'error', message: 'Internal server error' });
   } finally {
     client.release();
   }
@@ -123,7 +127,7 @@ router.get('/', async (req, res) => {
     });
   } catch (err) {
     console.error('[Contacts] Get error:', err.message);
-    res.status(500).json({ status: 'error', message: err.message });
+    res.status(500).json({ status: 'error', message: 'Internal server error' });
   }
 });
 
@@ -139,7 +143,8 @@ router.delete('/', async (req, res) => {
     }
     res.json({ status: 'success', message: 'Contacts cleared' });
   } catch (err) {
-    res.status(500).json({ status: 'error', message: err.message });
+    console.error('[Contacts] Delete error:', err.message);
+    res.status(500).json({ status: 'error', message: 'Internal server error' });
   }
 });
 
