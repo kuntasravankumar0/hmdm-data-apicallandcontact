@@ -5,13 +5,15 @@ let pool;
 
 function getPool() {
   if (!pool) {
+    const connectionString = process.env.DATABASE_URL || 
+      `postgresql://${process.env.DB_USERNAME || 'avnadmin'}:${encodeURIComponent(process.env.DB_PASSWORD || '')}@${process.env.DB_HOST || 'pg-7cd95c5-elenah-4365.l.aivencloud.com'}:${process.env.DB_PORT || '20827'}/${process.env.DB_NAME || 'defaultdb'}?sslmode=require`;
+    
     pool = new Pool({
-      connectionString: process.env.DATABASE_URL || 
-        `postgresql://${process.env.DB_USERNAME || 'avnadmin'}:${process.env.DB_PASSWORD || ''}@${process.env.DB_HOST || 'pg-7cd95c5-elenah-4365.l.aivencloud.com'}:${process.env.DB_PORT || '20827'}/${process.env.DB_NAME || 'defaultdb'}?sslmode=require`,
+      connectionString,
       ssl: { rejectUnauthorized: false },
       max: 10,
       idleTimeoutMillis: 30000,
-      connectionTimeoutMillis: 10000,
+      connectionTimeoutMillis: 15000,
     });
   }
   return pool;
@@ -37,8 +39,9 @@ async function initDatabase() {
         UNIQUE(device_id, contact_id)
       );
     `);
+    console.log('[DB] device_contacts table ready');
 
-    // Create call logs table
+    // Create call logs table with dedup: device_id + call_date + phone + type + duration
     await client.query(`
       CREATE TABLE IF NOT EXISTS device_call_logs (
         id SERIAL PRIMARY KEY,
@@ -54,8 +57,9 @@ async function initDatabase() {
         UNIQUE(device_id, call_date, phone_number, call_type, duration_sec)
       );
     `);
+    console.log('[DB] device_call_logs table ready');
 
-    // Create notifications table
+    // Create notifications table with dedup: device_id + received_at + package + title
     await client.query(`
       CREATE TABLE IF NOT EXISTS device_notifications (
         id SERIAL PRIMARY KEY,
@@ -70,8 +74,9 @@ async function initDatabase() {
         UNIQUE(device_id, received_at, package_name, title)
       );
     `);
+    console.log('[DB] device_notifications table ready');
 
-    // Create device info table
+    // Create device info table (for GPS/location/status)
     await client.query(`
       CREATE TABLE IF NOT EXISTS device_info (
         id SERIAL PRIMARY KEY,
@@ -82,6 +87,7 @@ async function initDatabase() {
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       );
     `);
+    console.log('[DB] device_info table ready');
 
     // Create indexes for faster queries
     await client.query(`
@@ -93,6 +99,7 @@ async function initDatabase() {
       CREATE INDEX IF NOT EXISTS idx_notifications_time ON device_notifications(received_at DESC);
       CREATE INDEX IF NOT EXISTS idx_deviceinfo_device ON device_info(device_id);
     `);
+    console.log('[DB] Indexes created');
 
     console.log('[DB] All tables initialized successfully');
   } catch (err) {
