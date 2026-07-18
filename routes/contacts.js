@@ -1,9 +1,9 @@
 const express = require('express');
-const { getPool } = require('../db');
+const { getPool, batchUpsert } = require('../db');
 
 const router = express.Router();
 
-// POST /api/contacts/sync - Sync contacts from device
+// POST /api/contacts/sync - Sync contacts in bulk
 router.post('/sync', async (req, res) => {
   const { deviceId, contacts } = req.body;
   
@@ -15,70 +15,58 @@ router.post('/sync', async (req, res) => {
     return res.json({ status: 'success', message: 'No contacts to sync', saved: 0 });
   }
 
-  const pool = getPool();
-  const client = await pool.connect();
-  let saved = 0;
-  let updated = 0;
-
   try {
-    await client.query('BEGIN');
     const now = Date.now();
-
-    for (const contact of contacts) {
+    const pool = getPool();
+    
+    // Prepare items: normalize contact data
+    const items = contacts.map(contact => {
       const contactId = String(contact.contactId || contact.rawContactId || '');
-      const name = String(contact.name || '');
       const phone = String(contact.phone || '');
-      const phoneType = String(contact.phoneType || '');
       const email = String(contact.email || '');
-
-      // If contact_id is empty, use phone or email as dedup key
+      
+      // Fallback if contact_id is empty
       const effectiveContactId = contactId || 
         (phone ? `phone:${phone}` : '') || 
         (email ? `email:${email}` : '') || 
-        `unknown:${now}`;
+        `unknown:${now}_${Math.random().toString(36).substr(2,4)}`;
 
-      // Upsert: insert or update existing contact
-      const result = await client.query(
-        `INSERT INTO device_contacts (device_id, contact_id, name, phone, phone_type, email, raw_data, synced_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-         ON CONFLICT (device_id, contact_id)
-         DO UPDATE SET 
-           name = EXCLUDED.name,
-           phone = EXCLUDED.phone,
-           phone_type = EXCLUDED.phone_type,
-           email = EXCLUDED.email,
-           raw_data = EXCLUDED.raw_data,
-           synced_at = EXCLUDED.synced_at,
-           updated_at = CURRENT_TIMESTAMP
-         RETURNING (xmax = 0) AS inserted`,
-        [deviceId, effectiveContactId, name, phone, phoneType, email, JSON.stringify(contact), now]
-      );
-      
-      if (result.rows[0]?.inserted) {
-        saved++;
-      } else {
-        updated++;
-      }
-    }
+      return {
+        device_id: deviceId,
+        contact_id: effectiveContactId,
+        name: String(contact.name || ''),
+        phone: phone,
+        phone_type: String(contact.phoneType || contact.phone_type || ''),
+        email: email,
+        raw_data: JSON.stringify(contact),
+        synced_at: now
+      };
+    });
 
-    await client.query('COMMIT');
+    // Batch upsert in chunks (100 per batch)
+    const result = await batchUpsert(
+      'device_contacts',
+      ['device_id', 'contact_id', 'name', 'phone', 'phone_type', 'email', 'raw_data', 'synced_at'],
+      items,
+      ['device_id', 'contact_id'],
+      ['name', 'phone', 'phone_type', 'email', 'raw_data', 'synced_at'],
+      'UPDATE'
+    );
+
     res.json({
       status: 'success',
-      saved,
-      updated,
+      saved: result.saved,
+      updated: result.updated || 0,
       total: contacts.length,
       deviceId
     });
   } catch (err) {
-    await client.query('ROLLBACK');
     console.error('[Contacts] Sync error:', err.message);
     res.status(500).json({ status: 'error', message: 'Internal server error' });
-  } finally {
-    client.release();
   }
 });
 
-// GET /api/contacts - Get all contacts
+// GET /api/contacts - Get contacts with pagination + search
 router.get('/', async (req, res) => {
   const { deviceId, limit = 100, offset = 0, search } = req.query;
   
@@ -92,7 +80,6 @@ router.get('/', async (req, res) => {
       query += ` AND device_id = $${paramIndex++}`;
       params.push(deviceId);
     }
-
     if (search) {
       query += ` AND (name ILIKE $${paramIndex} OR phone ILIKE $${paramIndex} OR email ILIKE $${paramIndex})`;
       params.push(`%${search}%`);
@@ -102,28 +89,24 @@ router.get('/', async (req, res) => {
     query += ` ORDER BY name ASC LIMIT $${paramIndex++} OFFSET $${paramIndex++}`;
     params.push(parseInt(limit), parseInt(offset));
 
-    const result = await pool.query(query, params);
-    
-    // Get total count
-    let countQuery = 'SELECT COUNT(*) FROM device_contacts WHERE 1=1';
-    const countParams = [];
-    let countIdx = 1;
-    if (deviceId) {
-      countQuery += ` AND device_id = $${countIdx++}`;
-      countParams.push(deviceId);
-    }
-    if (search) {
-      countQuery += ` AND (name ILIKE $${countIdx} OR phone ILIKE $${countIdx} OR email ILIKE $${countIdx})`;
-      countParams.push(`%${search}%`);
-    }
-    const countResult = await pool.query(countQuery, countParams);
+    const [dataResult, countResult] = await Promise.all([
+      pool.query(query, params),
+      (() => {
+        let cq = 'SELECT COUNT(*) FROM device_contacts WHERE 1=1';
+        const cp = [];
+        let ci = 1;
+        if (deviceId) { cq += ` AND device_id = $${ci++}`; cp.push(deviceId); }
+        if (search) { cq += ` AND (name ILIKE $${ci} OR phone ILIKE $${ci} OR email ILIKE $${ci})`; cp.push(`%${search}%`); }
+        return pool.query(cq, cp);
+      })()
+    ]);
 
     res.json({
       status: 'success',
       total: parseInt(countResult.rows[0].count),
       limit: parseInt(limit),
       offset: parseInt(offset),
-      data: result.rows
+      data: dataResult.rows
     });
   } catch (err) {
     console.error('[Contacts] Get error:', err.message);
@@ -131,7 +114,7 @@ router.get('/', async (req, res) => {
   }
 });
 
-// DELETE /api/contacts - Clear contacts
+// DELETE /api/contacts
 router.delete('/', async (req, res) => {
   const { deviceId } = req.query;
   try {

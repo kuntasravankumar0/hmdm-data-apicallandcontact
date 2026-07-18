@@ -1,9 +1,9 @@
 const express = require('express');
-const { getPool } = require('../db');
+const { getPool, batchUpsert } = require('../db');
 
 const router = express.Router();
 
-// POST /api/notifications/sync - Sync notifications from device
+// POST /api/notifications/sync - Sync notifications in bulk
 router.post('/sync', async (req, res) => {
   const { deviceId, notifications } = req.body;
   
@@ -15,59 +15,44 @@ router.post('/sync', async (req, res) => {
     return res.json({ status: 'success', message: 'No notifications to sync', saved: 0 });
   }
 
-  const pool = getPool();
-  const client = await pool.connect();
-  let saved = 0;
-  let skipped = 0;
-
   try {
-    await client.query('BEGIN');
     const now = Date.now();
+    
+    // Prepare items for batch insert
+    const items = notifications.map(notif => ({
+      device_id: deviceId,
+      package_name: String(notif.packageName || notif.package_name || ''),
+      app_name: String(notif.appName || notif.app_name || ''),
+      title: String(notif.title || ''),
+      text_body: String(notif.text || notif.textBody || notif.text_body || ''),
+      received_at: parseInt(notif.receivedAt || notif.received_at || now),
+      synced_at: now
+    })).filter(item => item.title || item.text_body); // Skip empty entries
 
-    for (const notif of notifications) {
-      const packageName = String(notif.packageName || notif.package_name || '');
-      const appName = String(notif.appName || notif.app_name || '');
-      const title = String(notif.title || '');
-      const textBody = String(notif.text || notif.textBody || notif.text_body || '');
-      const receivedAt = parseInt(notif.receivedAt || notif.received_at || now);
+    // Batch insert with dedup (ON CONFLICT DO NOTHING)
+    const result = await batchUpsert(
+      'device_notifications',
+      ['device_id', 'package_name', 'app_name', 'title', 'text_body', 'received_at', 'synced_at'],
+      items,
+      ['device_id', 'received_at', 'package_name', 'title'],
+      null,
+      'NOTHING'
+    );
 
-      if (!title && !textBody) continue;
-
-      // Dedup by device_id + received_at + package_name + title
-      const result = await client.query(
-        `INSERT INTO device_notifications (device_id, package_name, app_name, title, text_body, received_at, synced_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7)
-         ON CONFLICT (device_id, received_at, package_name, title)
-         DO NOTHING
-         RETURNING id`,
-        [deviceId, packageName, appName, title, textBody, receivedAt, now]
-      );
-
-      if (result.rows.length > 0) {
-        saved++;
-      } else {
-        skipped++;
-      }
-    }
-
-    await client.query('COMMIT');
     res.json({
       status: 'success',
-      saved,
-      skipped,
+      saved: result.saved,
+      skipped: result.skipped,
       total: notifications.length,
       deviceId
     });
   } catch (err) {
-    await client.query('ROLLBACK');
     console.error('[Notifications] Sync error:', err.message);
-    res.status(500).json({ status: 'error', message: err.message });
-  } finally {
-    client.release();
+    res.status(500).json({ status: 'error', message: 'Internal server error' });
   }
 });
 
-// GET /api/notifications - Get notifications
+// GET /api/notifications - Get notifications with pagination
 router.get('/', async (req, res) => {
   const { deviceId, limit = 50, offset = 0, app } = req.query;
   
@@ -87,28 +72,31 @@ router.get('/', async (req, res) => {
       paramIndex++;
     }
 
-    query += ` ORDER BY received_at DESC LIMIT $${paramIndex++} OFFSET $${paramIndex++}`;
+    const paginatedQuery = query + ` ORDER BY received_at DESC LIMIT $${paramIndex++} OFFSET $${paramIndex++}`;
     params.push(parseInt(limit), parseInt(offset));
 
-    const result = await pool.query(query, params);
-
-    let countQuery = 'SELECT COUNT(*) FROM device_notifications WHERE 1=1';
-    const countParams = [];
-    let ci = 1;
-    if (deviceId) { countQuery += ` AND device_id = $${ci++}`; countParams.push(deviceId); }
-    if (app) { countQuery += ` AND (app_name ILIKE $${ci} OR package_name ILIKE $${ci})`; countParams.push(`%${app}%`); }
-    const countResult = await pool.query(countQuery, countParams);
+    const [dataResult, countResult] = await Promise.all([
+      pool.query(paginatedQuery, params),
+      (() => {
+        let cq = 'SELECT COUNT(*) FROM device_notifications WHERE 1=1';
+        const cp = [];
+        let ci = 1;
+        if (deviceId) { cq += ` AND device_id = $${ci++}`; cp.push(deviceId); }
+        if (app) { cq += ` AND (app_name ILIKE $${ci} OR package_name ILIKE $${ci})`; cp.push(`%${app}%`); }
+        return pool.query(cq, cp);
+      })()
+    ]);
 
     res.json({
       status: 'success',
       total: parseInt(countResult.rows[0].count),
       limit: parseInt(limit),
       offset: parseInt(offset),
-      data: result.rows
+      data: dataResult.rows
     });
   } catch (err) {
     console.error('[Notifications] Get error:', err.message);
-    res.status(500).json({ status: 'error', message: err.message });
+    res.status(500).json({ status: 'error', message: 'Internal server error' });
   }
 });
 
@@ -124,7 +112,8 @@ router.delete('/', async (req, res) => {
     }
     res.json({ status: 'success', message: 'Notifications cleared' });
   } catch (err) {
-    res.status(500).json({ status: 'error', message: err.message });
+    console.error('[Notifications] Delete error:', err.message);
+    res.status(500).json({ status: 'error', message: 'Internal server error' });
   }
 });
 
