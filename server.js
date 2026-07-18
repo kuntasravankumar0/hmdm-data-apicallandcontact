@@ -18,8 +18,10 @@ const API_KEY = process.env.API_KEY || '';
 const JWT_SECRET = process.env.JWT_SECRET || 'hmdm-data-api-secret-key-2024';
 const JWT_EXPIRES_IN = '24h';
 
-// Backend login proxy target
-const HMDM_BACKEND_URL = process.env.HMDM_BACKEND_URL || 'https://hmdmbackend.onrender.com';
+// Local admin credentials (override via env vars)
+// Set ADMIN_LOGIN and ADMIN_PASSWORD in Render env for custom credentials
+const ADMIN_LOGIN = process.env.ADMIN_LOGIN || 'Sravan@admin.com';
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'Sravan@123';
 
 // === SECURITY & PARSING ===
 app.use(helmet({ contentSecurityPolicy: false }));
@@ -97,59 +99,26 @@ app.use(authMiddleware);
 
 // === AUTH ROUTES ===
 
-// POST /api/auth/login - Proxy credentials to hmdmbackend, issue our JWT on success
-app.post('/api/auth/login', async (req, res) => {
+// POST /api/auth/login - Local auth, issue JWT on success
+// No dependency on hmdmbackend or hmdm-server
+app.post('/api/auth/login', (req, res) => {
   const { login, password } = req.body;
 
   if (!login || !password) {
     return res.status(400).json({ status: 'error', message: 'Missing login or password' });
   }
 
-  try {
-    const https = require('https');
-    const postData = JSON.stringify({ login, password });
-    const url = new URL(HMDM_BACKEND_URL + '/rest/public/jwt/login');
-
-    const response = await new Promise((resolve, reject) => {
-      const options = {
-        hostname: url.hostname,
-        port: 443,
-        path: url.pathname,
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Content-Length': Buffer.byteLength(postData)
-        },
-        timeout: 15000
-      };
-
-      const reqHttps = https.request(options, (resHttp) => {
-        let data = '';
-        resHttp.on('data', chunk => data += chunk);
-        resHttp.on('end', () => resolve({ status: resHttp.statusCode, body: data }));
-      });
-
-      reqHttps.on('error', reject);
-      reqHttps.on('timeout', () => { reqHttps.destroy(); reject(new Error('Timeout')); });
-      reqHttps.write(postData);
-      reqHttps.end();
-    });
-
-    if (response.status === 200) {
-      const token = jwt.sign(
-        { username: login, auth: 'dashboard', iat: Math.floor(Date.now() / 1000) },
-        JWT_SECRET,
-        { expiresIn: JWT_EXPIRES_IN }
-      );
-      return res.json({ status: 'success', token, message: 'Login successful' });
-    }
-
-    return res.status(401).json({ status: 'error', message: 'Invalid username or password' });
-
-  } catch (err) {
-    console.error('[Auth] Login proxy error:', err.message);
-    return res.status(503).json({ status: 'error', message: 'Authentication service unavailable. Please try again.' });
+  // Check against env-configured admin credentials
+  if (login === ADMIN_LOGIN && password === ADMIN_PASSWORD) {
+    const token = jwt.sign(
+      { username: login, auth: 'dashboard', iat: Math.floor(Date.now() / 1000) },
+      JWT_SECRET,
+      { expiresIn: JWT_EXPIRES_IN }
+    );
+    return res.json({ status: 'success', token, message: 'Login successful' });
   }
+
+  return res.status(401).json({ status: 'error', message: 'Invalid username or password' });
 });
 
 // GET /api/auth/verify - Check if current token is still valid
@@ -279,7 +248,7 @@ async function start() {
     app.listen(PORT, '0.0.0.0', () => {
       const mem = process.memoryUsage();
       console.log(`[Server] hmdm-data-api running on port ${PORT}`);
-      console.log(`[Server] Auth: JWT with hmdmbackend at ${HMDM_BACKEND_URL}`);
+      console.log(`[Server] Auth: local credentials (login: ${ADMIN_LOGIN})`);
       console.log(`[Server] Memory: ${Math.round(mem.rss/1024/1024)}MB RSS | ${Math.round(mem.heapUsed/1024/1024)}MB heap`);
       console.log(`[Server] Health: http://localhost:${PORT}/health`);
     });
