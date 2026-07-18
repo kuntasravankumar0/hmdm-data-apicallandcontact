@@ -2,6 +2,7 @@ const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
 const path = require('path');
+const jwt = require('jsonwebtoken');
 const { initDatabase, checkMemory, startMemoryMonitor } = require('./db');
 
 // Import routes
@@ -13,63 +14,227 @@ const app = express();
 const PORT = process.env.PORT || 3001;
 const API_KEY = process.env.API_KEY || '';
 
-// === SECURITY & PARSING (optimized for 512MB) ===
+// JWT config
+const JWT_SECRET = process.env.JWT_SECRET || 'hmdm-data-api-secret-key-2024';
+const JWT_EXPIRES_IN = '24h';
+
+// Backend login proxy target
+const HMDM_BACKEND_URL = process.env.HMDM_BACKEND_URL || 'https://hmdmbackend.onrender.com';
+
+// === SECURITY & PARSING ===
 app.use(helmet({ contentSecurityPolicy: false }));
 app.use(cors());
-
-// Smaller body limit to prevent memory spikes from huge payloads
-app.use(express.json({ limit: '2mb' }));       // Was 10mb
+app.use(express.json({ limit: '2mb' }));
 app.use(express.urlencoded({ extended: true, limit: '1mb' }));
 
-// === REQUEST TIMEOUT MIDDLEWARE ===
-// Prevents slow requests from piling up
+// === REQUEST TIMEOUT ===
 app.use((req, res, next) => {
-  // No timeout for GET (they're fast), only for POST syncs
   if (req.method === 'POST') {
-    req.setTimeout(30000, () => {                // 30s timeout for POSTs
-      console.warn(`[TIMEOUT] Request timed out: ${req.method} ${req.path}`);
+    req.setTimeout(30000, () => {
+      console.warn(`[TIMEOUT] ${req.method} ${req.path}`);
       res.status(408).json({ status: 'error', message: 'Request timed out' });
     });
   }
   next();
 });
 
-// === MEMORY CHECK MIDDLEWARE ===
-// Reject requests early if memory is too high
+// === MEMORY CHECK ===
 app.use((req, res, next) => {
   if (req.method === 'POST' && checkMemory()) {
-    return res.status(503).json({ 
-      status: 'error', 
-      message: 'Server busy, try again shortly' 
-    });
+    return res.status(503).json({ status: 'error', message: 'Server busy, try again shortly' });
   }
   next();
 });
 
-// === API KEY AUTH ===
+// === JWT AUTH MIDDLEWARE ===
+// Protects all routes except /health, /login, /api/auth/*
 function authMiddleware(req, res, next) {
-  if (req.method === 'GET' || !API_KEY) {
+  // Public routes (no auth required)
+  const publicPaths = ['/health', '/login', '/api/auth'];
+  if (publicPaths.some(p => req.path.startsWith(p))) {
     return next();
   }
-  const apiKey = req.headers['x-api-key'] || req.query.api_key;
-  if (apiKey !== API_KEY) {
-    return res.status(401).json({ status: 'error', message: 'Invalid API key' });
+  
+  // Static files: login.html and dashboard.html need checking
+  // Dashboard needs auth, login page is public
+  if (req.path === '/' || req.path === '/login' || req.path === '/login.html') {
+    return next();
   }
+  
+  // For dashboard page, check JWT
+  if (req.path.startsWith('/dashboard')) {
+    const token = extractToken(req);
+    if (!token) {
+      return res.redirect('/login');
+    }
+    try {
+      jwt.verify(token, JWT_SECRET);
+      return next();
+    } catch (err) {
+      return res.redirect('/login');
+    }
+  }
+
+  // For API routes (except /api/auth), require JWT or API key
+  if (req.path.startsWith('/api') && !req.path.startsWith('/api/auth')) {
+    // API key check takes priority (for device syncs)
+    const apiKey = req.headers['x-api-key'] || req.query.api_key;
+    if (apiKey && apiKey === API_KEY) {
+      return next();
+    }
+    
+    // JWT check for web dashboard
+    const token = extractToken(req);
+    if (token) {
+      try {
+        jwt.verify(token, JWT_SECRET);
+        return next();
+      } catch (err) {
+        return res.status(401).json({ status: 'error', message: 'Session expired. Please login again.' });
+      }
+    }
+    
+    return res.status(401).json({ status: 'error', message: 'Authentication required' });
+  }
+  
   next();
 }
 
-app.use('/api', authMiddleware);
+function extractToken(req) {
+  // Check Authorization header first
+  const authHeader = req.headers['authorization'];
+  if (authHeader && authHeader.startsWith('Bearer ')) {
+    return authHeader.substring(7);
+  }
+  // Check query param
+  if (req.query.token) {
+    return req.query.token;
+  }
+  return null;
+}
+
+app.use(authMiddleware);
+
+// === AUTH ROUTES ===
+// POST /api/auth/login - Validate credentials via hmdmbackend, issue JWT
+app.post('/api/auth/login', async (req, res) => {
+  const { login, password } = req.body;
+  
+  if (!login || !password) {
+    return res.status(400).json({ status: 'error', message: 'Missing login or password' });
+  }
+  
+  try {
+    // Proxy login request to hmdmbackend
+    const https = require('https');
+    const postData = JSON.stringify({ login, password });
+    
+    const url = new URL(HMDM_BACKEND_URL + '/rest/public/jwt/login');
+    
+    const response = await new Promise((resolve, reject) => {
+      const options = {
+        hostname: url.hostname,
+        port: 443,
+        path: url.pathname,
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Content-Length': Buffer.byteLength(postData)
+        },
+        timeout: 15000
+      };
+      
+      const reqHttps = https.request(options, (resHttp) => {
+        let data = '';
+        resHttp.on('data', chunk => data += chunk);
+        resHttp.on('end', () => {
+          resolve({ status: resHttp.statusCode, body: data });
+        });
+      });
+      
+      reqHttps.on('error', reject);
+      reqHttps.on('timeout', () => { reqHttps.destroy(); reject(new Error('Timeout')); });
+      reqHttps.write(postData);
+      reqHttps.end();
+    });
+    
+    if (response.status === 200) {
+      // Login success - create our own JWT
+      const token = jwt.sign(
+        { username: login, auth: 'dashboard', iat: Math.floor(Date.now() / 1000) },
+        JWT_SECRET,
+        { expiresIn: JWT_EXPIRES_IN }
+      );
+      
+      return res.json({
+        status: 'success',
+        token,
+        message: 'Login successful'
+      });
+    }
+    
+    // Login failed
+    return res.status(401).json({
+      status: 'error',
+      message: 'Invalid username or password'
+    });
+    
+  } catch (err) {
+    console.error('[Auth] Login proxy error:', err.message);
+    return res.status(503).json({
+      status: 'error',
+      message: 'Authentication service unavailable. Please try again.'
+    });
+  }
+});
+
+// GET /api/auth/verify - Verify current token is still valid
+app.get('/api/auth/verify', (req, res) => {
+  const token = extractToken(req);
+  if (!token) {
+    return res.status(401).json({ status: 'error', message: 'No token provided' });
+  }
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET);
+    return res.json({ status: 'success', username: decoded.username });
+  } catch (err) {
+    return res.status(401).json({ status: 'error', message: 'Invalid or expired token' });
+  }
+});
 
 // === STATIC FILES ===
+// Root serves dashboard if authenticated, login page otherwise
+app.get('/', (req, res) => {
+  const token = extractToken(req);
+  if (token) {
+    try {
+      jwt.verify(token, JWT_SECRET);
+      return res.sendFile(path.join(__dirname, 'public', 'dashboard.html'));
+    } catch (e) {}
+  }
+  res.sendFile(path.join(__dirname, 'public', 'login.html'));
+});
+
+// Serve login page explicitly
+app.get('/login', (req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'login.html'));
+});
+
+// Serve dashboard page explicitly (auth checked via middleware)
+app.get('/dashboard', (req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'dashboard.html'));
+});
+
+// Other static files
 app.use(express.static(path.join(__dirname, 'public')));
 
-// === HEALTH CHECK ===
+// === HEALTH ===
 app.get('/health', (req, res) => {
   const mem = process.memoryUsage();
-  res.json({ 
-    status: 'ok', 
-    service: 'hmdm-data-api', 
-    version: '1.0.0', 
+  res.json({
+    status: 'ok',
+    service: 'hmdm-data-api',
+    version: '1.0.0',
     uptime: process.uptime(),
     memory: `${Math.round(mem.heapUsed/1024/1024)}MB/${Math.round(mem.rss/1024/1024)}MB`
   });
@@ -83,9 +248,7 @@ app.use('/api/notifications', notificationsRouter);
 // === DEVICE INFO ===
 app.post('/api/device/info', async (req, res) => {
   const { deviceId, info } = req.body;
-  if (!deviceId) {
-    return res.status(400).json({ status: 'error', message: 'Missing deviceId' });
-  }
+  if (!deviceId) return res.status(400).json({ status: 'error', message: 'Missing deviceId' });
   try {
     const { getPool } = require('./db');
     const pool = getPool();
@@ -122,24 +285,17 @@ app.get('/api/device/info', async (req, res) => {
   }
 });
 
-// === SUMMARY (sequential queries to reduce connection usage) ===
+// === SUMMARY ===
 app.get('/api/summary', async (req, res) => {
   try {
     const { getPool } = require('./db');
     const pool = getPool();
-    
-    // Sequential queries = only 1 connection used at a time (was Promise.all = 6 connections)
     const contacts = await pool.query('SELECT COUNT(*) as count FROM device_contacts');
     const calllogs = await pool.query('SELECT COUNT(*) as count FROM device_call_logs');
     const notifications = await pool.query('SELECT COUNT(*) as count FROM device_notifications');
     const devices = await pool.query('SELECT COUNT(*) as count FROM device_info');
-    
-    const latestCall = await pool.query(
-      'SELECT device_id, phone_number, call_type, call_date, contact_name FROM device_call_logs ORDER BY call_date DESC LIMIT 5'
-    );
-    const latestNotif = await pool.query(
-      'SELECT device_id, app_name, title, received_at FROM device_notifications ORDER BY received_at DESC LIMIT 5'
-    );
+    const latestCall = await pool.query('SELECT device_id, phone_number, call_type, call_date, contact_name FROM device_call_logs ORDER BY call_date DESC LIMIT 5');
+    const latestNotif = await pool.query('SELECT device_id, app_name, title, received_at FROM device_notifications ORDER BY received_at DESC LIMIT 5');
 
     res.json({
       status: 'success',
@@ -149,10 +305,7 @@ app.get('/api/summary', async (req, res) => {
         notifications: parseInt(notifications.rows[0].count),
         devices: parseInt(devices.rows[0].count),
       },
-      recent: {
-        callLogs: latestCall.rows,
-        notifications: latestNotif.rows,
-      }
+      recent: { callLogs: latestCall.rows, notifications: latestNotif.rows }
     });
   } catch (err) {
     console.error('[Summary] Error:', err.message);
@@ -162,14 +315,13 @@ app.get('/api/summary', async (req, res) => {
 
 // === START ===
 async function start() {
-  // Start memory monitor (logs every 60s)
   startMemoryMonitor();
-  
   try {
     await initDatabase();
     app.listen(PORT, '0.0.0.0', () => {
       const mem = process.memoryUsage();
       console.log(`[Server] hmdm-data-api running on port ${PORT}`);
+      console.log(`[Server] Auth: JWT enabled (backend: ${HMDM_BACKEND_URL})`);
       console.log(`[Server] Memory: ${Math.round(mem.rss/1024/1024)}MB RSS | ${Math.round(mem.heapUsed/1024/1024)}MB heap`);
       console.log(`[Server] Health: http://localhost:${PORT}/health`);
     });
